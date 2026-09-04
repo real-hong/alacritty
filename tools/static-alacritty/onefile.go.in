@@ -1,0 +1,257 @@
+// License: MIT
+// Static launcher template.  The generated payload.tar.gz is embedded at build
+// time; keeping this file as .in avoids requiring it in ordinary Go builds.
+
+package main
+
+import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
+	_ "embed"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
+)
+
+//go:embed payload.tar.gz
+var payload []byte
+
+var buildID = "development"
+var payloadSHA256 = ""
+
+type hardLink struct {
+	name   string
+	target string
+}
+
+func pathIsWithin(root, candidate string) bool {
+	relative, err := filepath.Rel(root, candidate)
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
+func archivePath(root, name string) (string, error) {
+	cleaned := filepath.Clean(filepath.FromSlash(name))
+	if cleaned == "." {
+		return root, nil
+	}
+	if filepath.IsAbs(cleaned) || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("unsafe archive path: %q", name)
+	}
+	destination := filepath.Join(root, cleaned)
+	if !pathIsWithin(root, destination) {
+		return "", fmt.Errorf("archive path escapes extraction root: %q", name)
+	}
+	return destination, nil
+}
+
+func extractPayload(root string) error {
+	reader, err := gzip.NewReader(bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("open embedded payload: %w", err)
+	}
+	defer reader.Close()
+
+	tarReader := tar.NewReader(reader)
+	hardLinks := make([]hardLink, 0)
+	for {
+		header, err := tarReader.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("read embedded payload: %w", err)
+		}
+
+		destination, err := archivePath(root, header.Name)
+		if err != nil {
+			return err
+		}
+		mode := os.FileMode(header.Mode) & os.ModePerm
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(destination, mode); err != nil {
+				return fmt.Errorf("create directory %s: %w", destination, err)
+			}
+		case tar.TypeReg, tar.TypeRegA:
+			if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+				return fmt.Errorf("create parent directory for %s: %w", destination, err)
+			}
+			file, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+			if err != nil {
+				return fmt.Errorf("create %s: %w", destination, err)
+			}
+			_, copyErr := io.Copy(file, tarReader)
+			closeErr := file.Close()
+			if copyErr != nil {
+				return fmt.Errorf("extract %s: %w", destination, copyErr)
+			}
+			if closeErr != nil {
+				return fmt.Errorf("close %s: %w", destination, closeErr)
+			}
+		case tar.TypeSymlink:
+			if filepath.IsAbs(header.Linkname) {
+				return fmt.Errorf("unsafe absolute symlink target: %q", header.Linkname)
+			}
+			resolvedTarget := filepath.Clean(filepath.Join(filepath.Dir(destination), filepath.FromSlash(header.Linkname)))
+			if !pathIsWithin(root, resolvedTarget) {
+				return fmt.Errorf("symlink target escapes extraction root: %q", header.Linkname)
+			}
+			if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+				return fmt.Errorf("create parent directory for symlink %s: %w", destination, err)
+			}
+			if err := os.Symlink(filepath.FromSlash(header.Linkname), destination); err != nil {
+				return fmt.Errorf("create symlink %s: %w", destination, err)
+			}
+		case tar.TypeLink:
+			target, err := archivePath(root, header.Linkname)
+			if err != nil {
+				return err
+			}
+			hardLinks = append(hardLinks, hardLink{name: destination, target: target})
+		default:
+			return fmt.Errorf("unsupported archive entry type %d for %q", header.Typeflag, header.Name)
+		}
+	}
+
+	for _, link := range hardLinks {
+		if err := os.MkdirAll(filepath.Dir(link.name), 0o755); err != nil {
+			return fmt.Errorf("create parent directory for hard link %s: %w", link.name, err)
+		}
+		if err := os.Link(link.target, link.name); err != nil {
+			return fmt.Errorf("create hard link %s: %w", link.name, err)
+		}
+	}
+	return nil
+}
+
+func payloadIsReady(root string) bool {
+	marker, err := os.ReadFile(filepath.Join(root, ".complete"))
+	if err != nil || strings.TrimSpace(string(marker)) != payloadSHA256 {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(root, "bin", "alacritty"))
+	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0
+}
+
+func cacheBase() (string, error) {
+	base := os.Getenv("ALACRITTY_ONEFILE_CACHE_DIR")
+	if base == "" {
+		userCache, err := os.UserCacheDir()
+		if err != nil {
+			base = os.TempDir()
+		} else {
+			base = userCache
+		}
+		base = filepath.Join(base, "alacritty", "onefile")
+	}
+	absolute, err := filepath.Abs(base)
+	if err != nil {
+		return "", fmt.Errorf("resolve cache directory: %w", err)
+	}
+	if err := os.MkdirAll(absolute, 0o700); err != nil {
+		return "", fmt.Errorf("create cache directory: %w", err)
+	}
+	return absolute, nil
+}
+
+func preparePayload() (string, error) {
+	if len(payloadSHA256) != sha256.Size*2 {
+		return "", fmt.Errorf("invalid embedded payload checksum: %q", payloadSHA256)
+	}
+	base, err := cacheBase()
+	if err != nil {
+		return "", err
+	}
+	target := filepath.Join(base, "payload-"+payloadSHA256[:20])
+	if payloadIsReady(target) {
+		return target, nil
+	}
+
+	lock, err := os.OpenFile(filepath.Join(base, ".extract.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("open extraction lock: %w", err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return "", fmt.Errorf("lock extraction directory: %w", err)
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) //nolint:errcheck
+
+	if payloadIsReady(target) {
+		return target, nil
+	}
+	actualHash := fmt.Sprintf("%x", sha256.Sum256(payload))
+	if actualHash != payloadSHA256 {
+		return "", fmt.Errorf("embedded payload checksum mismatch: got %s", actualHash)
+	}
+	if err := os.RemoveAll(target); err != nil {
+		return "", fmt.Errorf("remove incomplete payload cache: %w", err)
+	}
+	temporary, err := os.MkdirTemp(base, ".extract-")
+	if err != nil {
+		return "", fmt.Errorf("create extraction directory: %w", err)
+	}
+	keepTemporary := false
+	defer func() {
+		if !keepTemporary {
+			_ = os.RemoveAll(temporary)
+		}
+	}()
+	if err := extractPayload(temporary); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(temporary, ".complete"), []byte(payloadSHA256+"\n"), 0o600); err != nil {
+		return "", fmt.Errorf("write payload completion marker: %w", err)
+	}
+	if err := os.Rename(temporary, target); err != nil {
+		return "", fmt.Errorf("publish extracted payload: %w", err)
+	}
+	keepTemporary = true
+	return target, nil
+}
+
+func setDefaultEnvironment(name, value string) error {
+	if os.Getenv(name) != "" {
+		return nil
+	}
+	if err := os.Setenv(name, value); err != nil {
+		return fmt.Errorf("set %s: %w", name, err)
+	}
+	return nil
+}
+
+func run() error {
+	root, err := preparePayload()
+	if err != nil {
+		return err
+	}
+	if err := os.Setenv("ALACRITTY_ONEFILE_ROOT", root); err != nil {
+		return fmt.Errorf("set ALACRITTY_ONEFILE_ROOT: %w", err)
+	}
+	if err := setDefaultEnvironment("FONTCONFIG_FILE", filepath.Join(root, "etc", "fonts", "fonts.conf")); err != nil {
+		return err
+	}
+	if err := setDefaultEnvironment("FONTCONFIG_PATH", filepath.Join(root, "etc", "fonts")); err != nil {
+		return err
+	}
+	if err := setDefaultEnvironment("TERMINFO", filepath.Join(root, "share", "terminfo")); err != nil {
+		return err
+	}
+
+	executable := filepath.Join(root, "bin", "alacritty")
+	arguments := append([]string{os.Args[0]}, os.Args[1:]...)
+	return syscall.Exec(executable, arguments, os.Environ())
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "alacritty one-file launcher (%s): %v\n", buildID, err)
+		os.Exit(1)
+	}
+}

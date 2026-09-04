@@ -1,0 +1,91 @@
+ARG GO_VERSION=1.25.0
+FROM docker.io/library/golang:${GO_VERSION}-alpine AS go-toolchain
+
+FROM docker.io/library/centos:7
+
+ARG CENTOS_VAULT_BASE=https://vault.centos.org/7.9.2009
+ARG RUST_VERSION=1.85.0
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+
+RUN printf '%s\n' \
+        '[base]' \
+        'name=CentOS-7 - Base' \
+        "baseurl=${CENTOS_VAULT_BASE}/os/\$basearch/" \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7' \
+        '' \
+        '[updates]' \
+        'name=CentOS-7 - Updates' \
+        "baseurl=${CENTOS_VAULT_BASE}/updates/\$basearch/" \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7' \
+        '' \
+        '[extras]' \
+        'name=CentOS-7 - Extras' \
+        "baseurl=${CENTOS_VAULT_BASE}/extras/\$basearch/" \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7' \
+        > /etc/yum.repos.d/CentOS-Base.repo \
+    && yum_proxy="${HTTPS_PROXY:-${HTTP_PROXY:-_none_}}" \
+    && yum --disableplugin=fastestmirror --setopt="proxy=${yum_proxy}" -y install \
+        binutils \
+        ca-certificates \
+        cmake \
+        curl \
+        dejavu-sans-mono-fonts \
+        file \
+        findutils \
+        fontconfig-devel \
+        freetype-devel \
+        gcc \
+        gcc-c++ \
+        git \
+        gzip \
+        libX11 \
+        libXcursor \
+        libXi \
+        libXrender \
+        libxcb-devel \
+        libxkbcommon-devel \
+        make \
+        mesa-libEGL \
+        mesa-libGL \
+        ncurses \
+        pkgconfig \
+        tar \
+        xcb-util-devel \
+    && yum clean all \
+    && rm -rf /var/cache/yum
+
+COPY --from=go-toolchain /usr/local/go /usr/local/go
+
+ENV CARGO_HOME=/opt/cargo
+ENV RUSTUP_HOME=/opt/rustup
+ENV PATH=/opt/cargo/bin:/usr/local/go/bin:${PATH}
+
+RUN curl --fail --location --retry 5 --proto '=https' --tlsv1.2 \
+        --output /tmp/rustup-init https://sh.rustup.rs \
+    && chmod +x /tmp/rustup-init \
+    && /tmp/rustup-init -y --no-modify-path --profile minimal \
+        --default-toolchain "${RUST_VERSION}" \
+    && rm -f /tmp/rustup-init \
+    && chmod -R a+rX /opt/cargo /opt/rustup \
+    && rustc --version \
+    && cargo --version \
+    && go version
+
+# CentOS 7 keeps the X11 adapter separate from libxkbcommon-devel, while
+# winit loads it at runtime through xkbcommon-dl.  Keep this as a separate
+# layer so the large EOL dependency/toolchain layers remain reusable.
+RUN yum_proxy="${HTTPS_PROXY:-${HTTP_PROXY:-_none_}}" \
+    && yum --disableplugin=fastestmirror --setopt="proxy=${yum_proxy}" -y install \
+        libxkbcommon-x11 \
+    && yum clean all \
+    && rm -rf /var/cache/yum
+
+ENV LANG=en_US.UTF-8
+WORKDIR /work
