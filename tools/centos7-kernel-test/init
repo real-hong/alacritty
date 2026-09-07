@@ -1,0 +1,81 @@
+#!/bin/bash
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+mkdir -p /proc /sys /dev /run /tmp
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /dev/shm /tmp /run /root
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /dev/shm
+chmod 1777 /tmp /dev/shm
+modprobe virtio_pci
+modprobe virtio_rng
+export HOME=/root LANG=C DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1
+exec >/dev/console 2>&1
+echo '=== NATIVE_KERNEL_TEST_BEGIN ==='
+uname -a
+cat /etc/centos-release
+rpm -q kernel glibc mesa-dri-drivers xorg-x11-server-Xvfb
+sha256sum /opt/alacritty
+/opt/alacritty --version
+echo VERSION_EXIT=$?
+/opt/alacritty --help >/dev/null
+echo HELP_EXIT=$?
+ldd /root/.cache/alacritty/onefile/payload-*/bin/alacritty
+echo '=== NATIVE_PTY_IOCTL_DIAGNOSTIC ==='
+python - <<'PYGUEST'
+import os, fcntl
+master, slave = os.openpty()
+print('LIBC_OPENPTY_OK master=%s slave=%s' % (os.isatty(master), os.isatty(slave)))
+try:
+    peer = fcntl.ioctl(master, 0x5441, os.O_RDWR | os.O_NOCTTY | 0x80000)
+    print('TIOCGPTPEER_OK=%s' % peer)
+except IOError as error:
+    print('TIOCGPTPEER_ERRNO=%s MESSAGE=%s' % (error.errno, error.strerror))
+os.close(master)
+os.close(slave)
+PYGUEST
+Xvfb :99 -screen 0 1024x768x24 +extension GLX +render -noreset -ac >/tmp/xvfb.log 2>&1 &
+for i in {1..30}; do
+    [ -S /tmp/.X11-unix/X99 ] && break
+    sleep 1
+done
+glxinfo -B
+failures=0
+for test_case in default-cache special-path-cold special-path-warm; do
+    echo "=== CASE $test_case ==="
+    if [ "$test_case" = default-cache ]; then
+        unset ALACRITTY_ONEFILE_CACHE_DIR
+    else
+        export ALACRITTY_ONEFILE_CACHE_DIR='/root/cache & fonts'
+    fi
+    rm -f /tmp/alacritty-child-kernel /tmp/alacritty-child-marker /tmp/alacritty-pty-marker
+    /opt/alacritty -vv --config-file /dev/null -e /bin/sh -c 'printf "ALACRITTY_NATIVE_KERNEL_PTY_OK\n"; uname -r > /tmp/alacritty-child-kernel; printf "ALACRITTY_NATIVE_KERNEL_PTY_OK\n" > /tmp/alacritty-child-marker; test -t 0 && test -t 1 && echo PTY_OK > /tmp/alacritty-pty-marker; sleep 3' >/tmp/alacritty.log 2>&1 &
+    alacritty_pid=$!
+    tail -f /tmp/alacritty.log &
+    log_pid=$!
+    (
+        sleep 90
+        kill -KILL "$alacritty_pid" 2>/dev/null
+    ) &
+    watchdog_pid=$!
+    wait "$alacritty_pid"
+    result=$?
+    kill "$watchdog_pid" 2>/dev/null
+    kill "$log_pid" 2>/dev/null
+    echo GUI_EXIT=$result
+    cat /tmp/alacritty.log /tmp/alacritty-child-kernel /tmp/alacritty-child-marker /tmp/alacritty-pty-marker
+
+    if [ "$result" = 0 ] && [ -s /tmp/alacritty-pty-marker ] && grep -qx '3.10.0-1160.el7.x86_64' /tmp/alacritty-child-kernel; then
+        echo "CASE_PASS=$test_case"
+    else
+        echo "CASE_FAIL=$test_case"
+        failures=$((failures + 1))
+    fi
+done
+cat /tmp/xvfb.log
+if [ "$failures" = 0 ]; then echo NATIVE_KERNEL_GUI_TEST_PASS; else echo NATIVE_KERNEL_GUI_TEST_FAIL; fi
+echo '=== NATIVE_KERNEL_TEST_END ==='
+sync
+poweroff -f
+sleep 10

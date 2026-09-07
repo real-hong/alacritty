@@ -1,0 +1,14 @@
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -242,7 +242,9 @@ fn open_user(controller: &OwnedFd, flags: rustix::pty::OpenptFlags) -> io::Result<Own
+     {
+         match rustix::pty::ioctl_tiocgptpeer(controller, flags) {
+             Ok(fd) => return Ok(fd),
+-            Err(io::Errno::NOSYS) | Err(io::Errno::PERM) => {}
++            // CentOS 7's 3.10 kernel reports ENOTTY for this unsupported ioctl.
++            // Use the existing ptsname/openat fallback on these kernels too.
++            Err(io::Errno::NOSYS) | Err(io::Errno::PERM) | Err(io::Errno::NOTTY) => {}
+             Err(e) => return Err(e),
+         }
+     }

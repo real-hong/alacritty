@@ -1,0 +1,2 @@
+FROM docker.io/library/centos:7
+RUN printf '[base]\nname=CentOS7\nbaseurl=https://vault.centos.org/7.9.2009/os/$basearch/\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7\n' > /etc/yum.repos.d/CentOS-Base.repo && yum --disableplugin=fastestmirror --disablerepo="*" --enablerepo=base --setopt="proxy=${HTTPS_PROXY:-${HTTP_PROXY:-_none_}}" -y install kernel-3.10.0-1160.el7 xorg-x11-server-Xvfb mesa-dri-drivers mesa-libGL mesa-libEGL glx-utils cpio && yum clean all

@@ -10,6 +10,7 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	_ "embed"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -130,6 +131,26 @@ func extractPayload(root string) error {
 	return nil
 }
 
+// Fontconfig shipped with CentOS 7 does not resolve prefix="relative" as
+// required here. Write the final absolute font path before publishing the cache.
+func configureFonts(extractedRoot, finalRoot string) error {
+	configPath := filepath.Join(extractedRoot, "etc", "fonts", "fonts.conf")
+	config, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+	const placeholder = "@ALACRITTY_FONT_DIR@"
+	if !bytes.Contains(config, []byte(placeholder)) {
+		return fmt.Errorf("bundled Fontconfig template is missing its font directory placeholder")
+	}
+	var escaped bytes.Buffer
+	if err := xml.EscapeText(&escaped, []byte(filepath.Join(finalRoot, "share", "fonts"))); err != nil {
+		return err
+	}
+	config = bytes.ReplaceAll(config, []byte(placeholder), escaped.Bytes())
+	return os.WriteFile(configPath, config, 0o644)
+}
+
 func payloadIsReady(root string) bool {
 	marker, err := os.ReadFile(filepath.Join(root, ".complete"))
 	if err != nil || strings.TrimSpace(string(marker)) != payloadSHA256 {
@@ -205,6 +226,9 @@ func preparePayload() (string, error) {
 	}()
 	if err := extractPayload(temporary); err != nil {
 		return "", err
+	}
+	if err := configureFonts(temporary, target); err != nil {
+		return "", fmt.Errorf("configure bundled fonts: %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(temporary, ".complete"), []byte(payloadSHA256+"\n"), 0o600); err != nil {
 		return "", fmt.Errorf("write payload completion marker: %w", err)

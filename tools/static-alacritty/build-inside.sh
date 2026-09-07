@@ -43,7 +43,45 @@ actual_commit="$(git_at_checkout rev-parse HEAD)"
 [[ -z "$(git_at_checkout status --short)" ]] ||
     die "cached upstream checkout is dirty: $checkout_root"
 
-cd -- "$checkout_root"
+# Keep the verified upstream checkout and Cargo registry cache untouched.
+# Patch only a checksum-verified dependency in a disposable build tree.
+compat_root="$work_root/centos7-compat"
+rm -rf -- "$compat_root"
+mkdir -p -- "$compat_root"
+cp -a -- "$checkout_root" "$compat_root/source"
+crate_name=rustix-openpty-0.2.0
+crate_sha256=1de16c7c59892b870a6336f185dc10943517f1327447096bbb7bb32cd85e2393
+crate_archive="$compat_root/$crate_name.crate"
+cached_crate="$(find "$CARGO_HOME/registry/cache" -name "$crate_name.crate" -print -quit 2>/dev/null || true)"
+if [[ -n "$cached_crate" ]]; then
+    cp -- "$cached_crate" "$crate_archive"
+else
+    curl --fail --location --retry 5 --output "$crate_archive" \
+        "https://static.crates.io/crates/rustix-openpty/$crate_name.crate"
+fi
+printf '%s  %s\n' "$crate_sha256" "$crate_archive" | sha256sum --check --status ||
+    die 'rustix-openpty archive checksum mismatch'
+mkdir -p -- "$compat_root/rustix-openpty"
+tar -xzf "$crate_archive" --strip-components=1 -C "$compat_root/rustix-openpty"
+cd -- "$compat_root"
+git apply --check --directory=rustix-openpty \
+    "$source_root/tools/static-alacritty/rustix-openpty-centos7.patch"
+git apply --directory=rustix-openpty \
+    "$source_root/tools/static-alacritty/rustix-openpty-centos7.patch"
+cd -- "$compat_root/source"
+cat >> Cargo.toml <<'PATCH_CONFIG'
+
+[patch.crates-io]
+rustix-openpty = { path = "../rustix-openpty" }
+PATCH_CONFIG
+# Change only this package's source to a local path; preserve all other pins.
+awk '
+    /^\[\[package\]\]/ { local_crate = 0 }
+    /^name = "rustix-openpty"$/ { local_crate = 1 }
+    local_crate && /^(source|checksum) = / { next }
+    { print }
+' Cargo.lock > Cargo.lock.local
+mv Cargo.lock.local Cargo.lock
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-C link-arg=-Wl,--disable-new-dtags,-rpath,$ORIGIN/../lib'
 
 cargo build \
@@ -105,7 +143,7 @@ copy_runtime_library() {
 
 find_library() {
     local soname="$1"
-    ldconfig -p | awk -v wanted="$soname" '$1 == wanted { print $NF; exit }'
+    ldconfig -p | awk -v wanted="$soname" '$1 == wanted && !found { print $NF; found = 1 }'
 }
 
 # Libraries loaded through dlopen(3) do not appear in DT_NEEDED.  Keep this
@@ -158,7 +196,7 @@ while IFS= read -r -d '' font; do
 done < <(find /usr/share/fonts/dejavu -type f -name 'DejaVuSansMono*.ttf' -print0)
 [[ -n "$(find "$stage_root/share/fonts" -type f -name '*.ttf' -print -quit)" ]] ||
     die 'the fallback DejaVu Sans Mono fonts are missing'
-sed -i '/<fontconfig>/a\  <dir prefix="relative">../../share/fonts</dir>' \
+sed -i '/<fontconfig>/a\  <dir>@ALACRITTY_FONT_DIR@</dir>' \
     "$stage_root/etc/fonts/fonts.conf"
 
 # Bundle the terminfo entries selected by Alacritty 0.17.0.
@@ -166,6 +204,8 @@ tic -x -o "$stage_root/share/terminfo" extra/alacritty.info
 
 cat > "$stage_root/PORTABILITY.txt" <<EOF
 Alacritty ${ALACRITTY_VERSION}, commit ${ALACRITTY_COMMIT}
+
+Compatibility patch: rustix-openpty 0.2.0 falls back on ENOTTY for old kernels.
 
 This payload was compiled on CentOS 7 and is embedded in a static one-file
 launcher.  It includes ordinary linked libraries, dlopen-loaded X11 and

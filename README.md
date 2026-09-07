@@ -1,6 +1,6 @@
 # Alacritty 0.17.0 / CentOS 7 单文件构建
 
-本项目在 CentOS 7 容器中编译官方 Alacritty `v0.17.0`，然后将程序、普通
+本项目在 CentOS 7 容器中编译 Alacritty `v0.17.0`，应用下述旧内核兼容补丁，再将程序、普通
 X11/字体动态库、Fontconfig 配置、DejaVu Sans Mono 和 terminfo 打包进一个
 **外层完全静态**的 ELF 启动器。
 
@@ -60,3 +60,27 @@ X Server 是窗口显示服务，OpenGL 用户态库必须与目标机器的显�
 构建机的 Mesa/NVIDIA 驱动硬塞进文件既不是真正的静态链接，也常常会让另一台
 机器无法启动。若要求连这两项也不存在，Alacritty 作为 GPU 图形终端本身就不
 满足需求，需要改用 framebuffer/纯文本程序，而不是改变链接参数。
+
+## CentOS 7 原生内核修复与回归测试
+
+构建会在独立副本中为 `rustix-openpty 0.2.0` 应用兼容补丁：
+`TIOCGPTPEER` 返回 `ENOTTY` 时，使用已有的 `ptsname/openat` 回退。
+依赖归档使用固定 SHA-256 校验；原始上游检出和 Cargo 注册表缓存不作修改。
+
+启动器解包时将包内字体目录写成最终缓存位置的绝对路径，并进行 XML 转义，
+解决 CentOS 7 Fontconfig 无法通过原相对路径找到字体的问题。
+
+```bash
+bash tools/centos7-kernel-test/run.sh
+# 也可将其他待测单文件路径作为第一个参数
+```
+
+此脚本首次运行会下载 CentOS 7 和 QEMU 测试组件。它用 QEMU 软件模拟独立启动
+官方 `3.10.0-1160.el7.x86_64` 内核、glibc 2.17 和 Xvfb/Mesa llvmpipe，
+无需 KVM 或主机图形桌面。程序运行在虚拟机的 3.10 内核中。
+测试验证默认缓存、含空格与 `&` 的自定义缓存，以及重复启动时的字体加载、
+渲染器初始化、PTY、shell 子进程和正常退出；不会修改解包后的字体配置。
+
+日志位于 `build/centos7-kernel-test/serial.log`，成功标记为
+`NATIVE_KERNEL_GUI_TEST_PASS`。该环境已实测通过；物理显卡驱动、其他内核补丁
+版本和完整桌面交互未在此测试覆盖范围内。外层静态、内层动态的依赖边界不变。
